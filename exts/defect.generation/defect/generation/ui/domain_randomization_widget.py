@@ -29,8 +29,6 @@ class RandomizerParameters():
         self.material_prims = {} 
         self.created_materials = {}
 
-        self.build_randomization_ui()
-
     def prepare_domain_randomization_request(self) -> DomainRandomizationRequest:
         light_domain_randomization_params = LightDomainRandomizationParameters()
         camera_domain_randomization_params = CameraDomainRandomizationParameters()

@@ -42,9 +42,13 @@ def is_valid_prim(path: str):
     return prim
 
 def delete_prim(path: str):
-    omni.kit.commands.execute('DeletePrims',
+    result = omni.kit.commands.execute('DeletePrims',
         paths=[path],
         destructive=False)
+    succeeded = result[0] if isinstance(result, tuple) else result is not False
+    prim = get_prim(path)
+    if not succeeded or (prim and prim.IsValid()):
+        raise RuntimeError(f"Failed to delete prim at {path}")
 
 def get_prim_attr(prim_path: str, attr_name: str):
     prim = get_prim(prim_path)

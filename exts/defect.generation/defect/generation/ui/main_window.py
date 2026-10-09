@@ -13,11 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import carb
 from typing import List
 import json
 import os
 import omni
+import omni.replicator.core as rep
 import omni.ui as ui
 from omni.ui import DockPreference
 from omni.kit.window.file_exporter import get_file_exporter
@@ -60,6 +62,7 @@ class MainWindow(ui.Window):
         self.object_params = None
         self.output_dir = None
         self.frame_change = None
+        self._replicator_task = None
         
         # List that stores all the defect parameters to be applied
         self.defect_parameters_list = {}
@@ -303,7 +306,7 @@ class MainWindow(ui.Window):
 
         with self._build_collapse_base("Defect Parameters"):
 
-            TEXTURE_DIR = os.path.join(Path(__file__).parents[3],"data")
+            TEXTURE_DIR = os.path.join(Path(__file__).parents[3], "data", "example")
             self.defect_text = CustomDirectory("Defect Texture Folder",
                             default_dir=str(TEXTURE_DIR),
                             tooltip="A folder location containing a single or set of textures (.png)")
@@ -372,15 +375,27 @@ class MainWindow(ui.Window):
                 self.original_materials = create_defect_layer(defect_generation_request, domain_randomization_request, **kwargs)
                 post_notification(f"Created defect layer with {len(self.defect_parameters_list)} total prims/groups and {sum(int(defect['args']['count']) for defects in self.defect_parameters_list.values() for defect in defects)} combined defects.", hide_after_timeout=True, duration=5, status=NotificationStatus.INFO)
        
-        def preview_data():
-            if does_defect_layer_exist():
-                rep_preview()
-            else:
-                _create_defect_layer()
+        def _graph_kwargs(**overrides):
+            kwargs = {
+                "output_dir": self.output_dir.directory,
+                "rt_subframes": max(1, self.rt_subframes.get_value_as_int()),
+                "use_seg": self._use_seg.as_bool,
+                "use_bb": self._use_bb.as_bool,
+                "use_bmw": self._use_bmw.as_bool,
+            }
+            kwargs.update(overrides)
+            return kwargs
+
+        async def preview_data():
+            await rep.orchestrator.stop_async()
+            if not does_defect_layer_exist():
+                _create_defect_layer(**_graph_kwargs())
                 self.rep_layer_button.text = "Recreate Replicator Graph"
+            rep_preview()
         
         # TODO: Fix that so it supports target_prim
-        def remove_replicator_graph():
+        async def remove_replicator_graph():
+            await rep.orchestrator.stop_async()
             restore_original_materials(self.original_materials)
             if get_defect_layer() is not None:
                 layer, pos = get_defect_layer()
@@ -401,7 +416,8 @@ class MainWindow(ui.Window):
                     logger.warning(f"Deleting : {prim_path}/Projection")
 
 
-        def delete_replicator_graph():
+        async def delete_replicator_graph():
+            await rep.orchestrator.stop_async()
             restore_original_materials(self.original_materials)
             self.randomizer_params.created_materials = {}
             if get_defect_layer() is not None:
@@ -432,8 +448,8 @@ class MainWindow(ui.Window):
                 logger.warning(f"Deleting : /Copied_Stage_Materials")
 
 
-        def run_replicator():
-            remove_replicator_graph()
+        async def run_replicator():
+            await remove_replicator_graph()
             total_frames = self.frames.get_value_as_int()
             subframes = self.rt_subframes.get_value_as_int()
             if subframes < 1:
@@ -443,7 +459,7 @@ class MainWindow(ui.Window):
                 subframes = 1
             if total_frames > 0:
                 post_notification(f"Running replicator with {total_frames} total frames and {subframes} subframes.", hide_after_timeout=True, duration=5, status=NotificationStatus.INFO)
-                _create_defect_layer(output_dir = self.output_dir.directory, frames = total_frames,rt_subframes=subframes ,use_seg = self._use_seg.as_bool,use_bb= self._use_bb.as_bool, use_bmw = self._use_bmw.as_bool)
+                _create_defect_layer(**_graph_kwargs(frames=total_frames, rt_subframes=subframes))
                 self.rep_layer_button.text = "Recreate Replicator Graph"
                 rep_run()
             else:
@@ -452,9 +468,9 @@ class MainWindow(ui.Window):
                     hide_after_timeout=True, duration=5, status=NotificationStatus.WARNING)
                 carb.log_error(f"Number of frames is {total_frames}. Input value needs to be greater than 0.")
         
-        def create_replicator_graph():
-            remove_replicator_graph()
-            _create_defect_layer()
+        async def create_replicator_graph():
+            await remove_replicator_graph()
+            _create_defect_layer(**_graph_kwargs(frames=max(1, self.frames.get_value_as_int())))
             self.rep_layer_button.text = "Recreate Replicator Graph"
 
         def set_text(label, model):
@@ -483,16 +499,16 @@ class MainWindow(ui.Window):
                 ui.IntField(model=self.rt_subframes)
             with ui.HStack(height=0):
                 self.rep_layer_button = ui.Button("Create Replicator Layer", 
-                                                clicked_fn=lambda: create_replicator_graph(), 
+                                                clicked_fn=lambda: self._schedule_replicator_action(create_replicator_graph),
                                                 tooltip="Creates/Recreates the Replicator Graph, based on the current Defect Parameters")
                 self.rep_delete_layer_button = ui.Button("Delete Replicator Layer", 
-                                        clicked_fn=lambda: delete_replicator_graph(), 
+                                        clicked_fn=lambda: self._schedule_replicator_action(delete_replicator_graph),
                                         tooltip="Deletes the Replicator Graph and all relevant components")
             with ui.HStack(height=0):
-                ui.Button("Preview", width=0, clicked_fn=lambda: preview_data(),
+                ui.Button("Preview", width=0, clicked_fn=lambda: self._schedule_replicator_action(preview_data),
                           tooltip="Preview a Replicator Scene")
                 ui.Label("or", width=0)
-                ui.Button("Run for", width=0, clicked_fn=lambda: run_replicator(),
+                ui.Button("Run for", width=0, clicked_fn=lambda: self._schedule_replicator_action(run_replicator),
                           tooltip="Run replicator for so many frames")
             
                 with ui.ZStack(width=0):
@@ -506,7 +522,33 @@ class MainWindow(ui.Window):
     ###############################
 
         
+    def _schedule_replicator_action(self, action):
+        if self._replicator_task is not None and not self._replicator_task.done():
+            post_notification(
+                "A Replicator operation is already in progress.",
+                duration=5, status=NotificationStatus.WARNING,
+            )
+            return
+        self._replicator_task = asyncio.ensure_future(action())
+        self._replicator_task.add_done_callback(self._replicator_action_finished)
+
+    def _replicator_action_finished(self, task):
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error(
+                "Replicator operation failed: %s", error,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+            post_notification(
+                f"Replicator operation failed: {error}",
+                duration=10, status=NotificationStatus.WARNING,
+            )
+
     def destroy(self) -> None:
+        if self._replicator_task is not None and not self._replicator_task.done():
+            self._replicator_task.cancel()
         self.frames = None
         self.defect_semantic = None
         if self.frame_change is not None:
