@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from asyncore import loop
 import omni.replicator.core as rep
 import carb
 from defect.generation.utils.helpers import get_textures, get_prim, get_all_children_paths, get_bbox_dimensions, rgba_to_rgb_dict, rgba_to_rgb_list, copy_prim, search_color_properties, create_color_attr
@@ -94,10 +93,25 @@ def _create_randomizers():
     rep.randomizer.register(change_light)
 
 
-def _create_camera():
-    camera = rep.create.camera(clipping_range=(0.001, 10000))
-    logger.warning(f"Creating Camera: {camera}")
+def _create_camera(position=None, look_at=None):
+    camera = rep.create.camera(position=position, look_at=look_at, clipping_range=(0.001, 10000))
+    logger.info(f"Creating Camera: {camera}")
     return camera
+
+def _default_camera_pose(prim_paths):
+    """Return a camera position/look-at pair that frames the union of the given prims' world bounds."""
+    bounds = [get_bbox_dimensions(str(path)) for path in prim_paths]
+    if not bounds:
+        return None, None
+    mins = [min(b[0][i] for b in bounds) for i in range(3)]
+    maxs = [max(b[1][i] for b in bounds) for i in range(3)]
+    if any(abs(v) > 1e30 for v in mins + maxs):
+        return None, None
+    center = tuple((lo + hi) / 2 for lo, hi in zip(mins, maxs))
+    extent = max(max(hi - lo for lo, hi in zip(mins, maxs)), 1e-3)
+    distance = extent * 2.0
+    position = (center[0] + distance, center[1] + distance, center[2] + distance)
+    return position, center
 
 def _create_camera_randomizer():
     def change_camera(change_camera_params, prim_defects_path, camera_domain_randomization_params: CameraDomainRandomizationParameters):
@@ -174,13 +188,13 @@ def get_original_materials(path):
 
 def _create_color_randomizer(color_domain_randomization_params): 
     prim_colors = color_domain_randomization_params.prim_colors
+    all_original_materials = {}
 
     if prim_colors is not None: 
         # Get RGB color values (OmmniPBR materials use RGB colors not RGBA)
         prim_colors = rgba_to_rgb_dict(prim_colors)
         
         created_materials = {}
-        all_original_materials = {}
         # Create an OmniPBR material with each specified color
         for path in prim_colors: 
                  
@@ -219,6 +233,9 @@ def _create_texture_color_randomizer(color_domain_randomization_params, material
             - A dictionary mapping each parent prim path to the new created material paths and the corresponding prim paths that they should be bound to.
     """
     prim_colors = color_domain_randomization_params.prim_colors
+    if not prim_colors:
+        return {}, {}
+
     stage = omni.usd.get_context().get_stage()
     mat_idx = 0
 
@@ -320,19 +337,19 @@ def _create_material_randomizer(material_randomization_params, prim_colors):
     all_original_materials = {}
     stage = omni.usd.get_context().get_stage()
     material_color_attrs = {}
-    created_materials = material_randomization_params.created_materials
+    created_materials = material_randomization_params.created_materials or {}
 
-    for material_prim, material_folders in material_randomization_params.material_prims.items():
+    for material_prim, material_folders in (material_randomization_params.material_prims or {}).items():
         # Store the original materials of the prim_path and its children prims.
         children_path, original_materials, unique_materials = get_original_materials(material_prim)
         children_prims[material_prim] = children_path
         all_original_materials[material_prim] = original_materials
-        if prim_colors is not None: 
+        if prim_colors:
             # If color material randomization is enabled, get and store the material's color attributes
             if material_prim not in material_color_attrs: 
                 material_color_attrs[material_prim] = []
 
-            for mat_path in created_materials[material_prim]: 
+            for mat_path in created_materials.get(material_prim, []):
                 # Get Material Shader path from stage
                 if len(stage.GetPrimAtPath(mat_path).GetChildren())>0:
                     shader_path = str(stage.GetPrimAtPath(mat_path).GetChildren()[0].GetPath())
@@ -344,14 +361,14 @@ def _create_material_randomizer(material_randomization_params, prim_colors):
                 material_color_attrs[material_prim].append((str(mat_path), change_color_attr))
 
     def randomize_materials():
-        for prim_path in material_randomization_params.material_prims:
+        for prim_path in material_randomization_params.material_prims or {}:
             children_paths = children_prims[prim_path]
-            materials_list = created_materials[prim_path]
+            materials_list = created_materials.get(prim_path, [])
 
             materials = []
-            if prim_colors is not None: 
+            if prim_colors:
                 # If color material randomization is enabled, get the stored material and color attributes
-                materials_list = material_color_attrs[prim_path]
+                materials_list = material_color_attrs.get(prim_path, [])
                 for mat_path, color_attr in materials_list: 
                     if color_attr != {}:
                         # If color attributes were found for the material, get the shader path to modify its attributes. 
@@ -378,9 +395,14 @@ def _create_material_randomizer(material_randomization_params, prim_colors):
 
                     else: 
                         logger.warning(f'Material {mat_path} has no color attributes.')
+                if not materials:
+                    materials = created_materials.get(prim_path, [])
             else: 
                 # If color material randomization is not enabled, get the materials from the created_materials list. 
                 materials = materials_list
+            if not materials:
+                logger.warning(f"No materials are available to randomize for {prim_path}.")
+                continue
             # Randomly select a material and apply it on the input prim and all its children. 
             chosen_material = rep.distribution.choice(materials, seed=random.randint(0, 999999))
             rep.modify.material(chosen_material, input_prims=children_paths)
@@ -391,9 +413,9 @@ def _create_material_randomizer(material_randomization_params, prim_colors):
 def _create_defects(defect_objet: DefectObject, prim_path: str):
     semantic_label = defect_objet.args.get("semantic_label", "default")
     # Get prim to place defect on
-    target_prim = rep.get.prims(path_pattern=prim_path)
+    target_prim = rep.get.prim_at_path(prim_path)
     # Create cube for projecting the material
-    cube = rep.create.cube(visible=False, semantics=[('class', semantic_label + '_mesh'),('uuid', defect_objet.uuid + '_mesh')], position=0, scale=1, rotation=(0, 0, 90))
+    cube = rep.create.cube(visible=False, semantics=[('class', semantic_label + '_mesh'),('uuid', defect_objet.uuid + '_mesh')], position=(0.0, 0.0, 0.0), scale=(1.0, 1.0, 1.0), rotation=(0, 0, 90))
     with target_prim:
         rep.create.projection_material(cube, [('class', semantic_label + '_projectmat'),('uuid', defect_objet.uuid + '_projectmat')])
 
@@ -409,6 +431,7 @@ def create_defect_layer(defect_generation_request: DefectGenerationRequest, doma
         prim_defects_path = []
         parent_prim_defects_path = []
         all_original_textures = {}
+        created_textures = {}
 
         # Create randomizers
         _create_randomizers()
@@ -432,7 +455,7 @@ def create_defect_layer(defect_generation_request: DefectGenerationRequest, doma
             original_textures = _create_material_randomizer(material_randomization_params, domain_randomization_request.color_domain_randomization_params.prim_colors)
             all_original_textures.update(original_textures)
         # Get camera params
-        camera_randomization_params = domain_randomization_request.camera_domain_randomization_params.camera_prims
+        camera_randomization_params = domain_randomization_request.camera_domain_randomization_params.camera_prims or []
 
         # Go through every prim which has defects
         for defect_prim_objects in defect_generation_request.prim_defects:
@@ -442,11 +465,11 @@ def create_defect_layer(defect_generation_request: DefectGenerationRequest, doma
             parent_prim_defects_path.append(Sdf.Path(defect_prim_objects.prim_path))
 
             if prim.GetTypeName() == "Xform":
-                logger.warning(f"{defect_prim_objects.prim_path} is an Xform")
+                logger.info(f"{defect_prim_objects.prim_path} is an Xform")
                 children = []
                 prim_defects_path.extend(get_all_children_paths(children, prim))
             else:
-                logger.warning(f"{defect_prim_objects.prim_path} is not an Xform")
+                logger.info(f"{defect_prim_objects.prim_path} is not an Xform")
                 prim_defects_path.append(Sdf.Path(defect_prim_objects.prim_path))
 
             # Create defects
@@ -468,13 +491,16 @@ def create_defect_layer(defect_generation_request: DefectGenerationRequest, doma
                     camera_randomization_params.append((None, get_bbox_dimensions(str(prim_defect_path))))
                 logger.warning(f"No camera prims were specified, new camera params: {camera_randomization_params}")
             #Transform every (scatter_prim, None) in camera params into a scatter prim paired with every defect parent prim in the scene
-            for index, camera_param in enumerate(camera_randomization_params):
-                scatter_params = []
+            expanded_camera_params = []
+            for camera_param in camera_randomization_params:
                 if not camera_param[1] and camera_param[0]:
-                    for prim_defect_path in parent_prim_defects_path:
-                        scatter_params.append((camera_param[0], get_bbox_dimensions(str(prim_defect_path))))
-                    camera_randomization_params.pop(index)
-                    camera_randomization_params.extend(scatter_params)
+                    expanded_camera_params.extend(
+                        (camera_param[0], get_bbox_dimensions(str(prim_defect_path)))
+                        for prim_defect_path in parent_prim_defects_path
+                    )
+                else:
+                    expanded_camera_params.append(camera_param)
+            camera_randomization_params = expanded_camera_params
                 # Create cameras with randomization information
             for camera_param in camera_randomization_params:
                 camera = _create_camera()
@@ -483,8 +509,9 @@ def create_defect_layer(defect_generation_request: DefectGenerationRequest, doma
                 render_list.append(render_product)
             logger.warning(f"Randomization params are : {change_camera_params}")
         else:
-            # If not domain randomization on camera, create a regular camera
-            camera = _create_camera()
+            # If no camera domain randomization, frame all defect targets with a fixed camera
+            position, look_at = _default_camera_pose(parent_prim_defects_path)
+            camera = _create_camera(position=position, look_at=look_at)
             render_product = rep.create.render_product(camera, (1024, 1024))
             render_list.append(render_product)
 
@@ -509,9 +536,14 @@ def create_defect_layer(defect_generation_request: DefectGenerationRequest, doma
             writer.initialize(output_dir=output_dir, rgb=True, semantic_segmentation=use_seg, bounding_box_2d_tight=use_bb)
         # Attach all render products to the writer
         writer.attach(render_list)
+        defect_count = sum(len(p.defects) for p in defect_generation_request.prim_defects)
+        logger.warning(
+            f"Replicator graph ready: {defect_count} defect projection(s), {len(render_list)} camera(s), "
+            f"{frames} frame(s), output: {output_dir}"
+        )
 
         # Setup randomization
-        with rep.trigger.on_frame(num_frames=frames, rt_subframes=rt_subframes):
+        with rep.trigger.on_frame(max_execs=frames, rt_subframes=rt_subframes):
 
             # Light domain randomization
             if domain_randomization_request.light_domain_randomization_params.active:
@@ -534,10 +566,9 @@ def create_defect_layer(defect_generation_request: DefectGenerationRequest, doma
                 rep.randomizer.randomize_materials()
 
             # Texture domain randomization
-            if domain_randomization_request.color_domain_randomization_params.texture_randomization:
-                if created_textures != {}:
-                    for parent_path in created_textures:      
-                        for material, prim_paths in created_textures[parent_path].items():
-                            # Bind the material to the corresponding prim_paths
-                            rep.modify.material([material], input_prims = prim_paths)
+            if created_textures:
+                for parent_path in created_textures:
+                    for material, prim_paths in created_textures[parent_path].items():
+                        # Bind the material to the corresponding prim_paths
+                        rep.modify.material([material], input_prims = prim_paths)
     return all_original_textures       

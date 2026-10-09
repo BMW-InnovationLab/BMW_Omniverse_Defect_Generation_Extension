@@ -1,13 +1,59 @@
-import json
 import io
-import os
-import numpy as np
-from typing import List
-from omni.replicator.core import Writer, AnnotatorRegistry, BackendDispatch
+import json
 import logging
+from typing import List, Optional
+
+import numpy as np
+from omni.replicator.core import AnnotatorRegistry, BackendDispatch, Writer
+
 logger = logging.getLogger(__name__)
 
+# Suffixes appended to a defect's semantic label by core.replicator.replicator_defect._create_defects
+_LABEL_SUFFIXES = ("_projectmat", "_mesh")
+_INVALID_BBOX_SIZE = 2147483647
+
+
+def normalize_label(label: str) -> str:
+    for suffix in _LABEL_SUFFIXES:
+        if label.endswith(suffix):
+            return label[: -len(suffix)]
+    return label
+
+
+def _array(annotator_output):
+    if isinstance(annotator_output, dict):
+        return annotator_output.get("data")
+    return annotator_output
+
+
+def _id_to_labels(annotator_output) -> dict:
+    if not isinstance(annotator_output, dict):
+        return {}
+    info = annotator_output.get("info") or annotator_output
+    return info.get("idToLabels") or {}
+
+
+def _class_label(labels) -> Optional[str]:
+    if isinstance(labels, dict):
+        label = labels.get("class")
+    else:
+        label = labels
+    if not label:
+        return None
+    # Several class labels on one prim are comma separated
+    return normalize_label(str(label).split(",")[0].strip())
+
+
 class BMWWriter(Writer):
+    """Writes RGB images plus BMW-format bounding box JSON and remapped segmentation.
+
+    Output layout (per render product sub-folder when more than one camera is used)::
+
+        images/<frame>.png
+        labels/json/<frame>.json
+        semantic_segmentation/<frame>.npy|.json
+    """
+
     def __init__(
             self,
             output_dir,
@@ -15,26 +61,24 @@ class BMWWriter(Writer):
             bounding_box_2d_tight: bool = False,
             semantic_segmentation: bool = False,
             image_output_format="png",
-            defects: List[str] = [],
+            defects: Optional[List[str]] = None,
     ):
         self._output_dir = output_dir
-        self._backend = BackendDispatch({"paths": {"out_dir": output_dir}})
+        self._backend = BackendDispatch(output_dir=output_dir)
+        self.backend = self._backend
         self._frame_id = 0
         self._image_output_format = image_output_format
         self.annotators = []
-        self.all_labels = defects
+        self.all_labels = {normalize_label(d) for d in (defects or [])}
         self.semantic_label_map = {}
 
-        # RGB
         if rgb:
             self.annotators.append(AnnotatorRegistry.get_annotator("rgb"))
 
-        # Bounding Box 2D
         if bounding_box_2d_tight:
             self.annotators.append(AnnotatorRegistry.get_annotator("bounding_box_2d_tight",
                                                                    init_params={"semanticTypes": ["class"]}))
 
-        # Semantic Segmentation
         if semantic_segmentation:
             self.annotators.append(AnnotatorRegistry.get_annotator(
                 "semantic_segmentation",
@@ -47,147 +91,89 @@ class BMWWriter(Writer):
     def check_bbox_area(self, bbox_data, size_limit):
         length = abs(bbox_data['x_min'] - bbox_data['x_max'])
         width = abs(bbox_data['y_min'] - bbox_data['y_max'])
+        return length * width > size_limit
 
-        area = length * width
-        if area > size_limit:
-            return True
-        else:
-            return False
+    @staticmethod
+    def _render_product_postfixes(data: dict) -> List[str]:
+        # Legacy data structure: a single render product uses bare annotator names,
+        # multiple render products use "<annotator>-<render product name>" keys.
+        render_products = [key[len("rp_"):] for key in data.keys() if key.startswith("rp_")]
+        if len(render_products) <= 1:
+            return [""]
+        return [f"-{name}" for name in render_products]
+
+    def _is_defect(self, labels) -> bool:
+        label = _class_label(labels)
+        return label is not None and label in self.all_labels
+
+    def _bbox_json(self, bbox_output) -> list:
+        bbox_data = _array(bbox_output)
+        id_to_labels = _id_to_labels(bbox_output)
+        json_data = []
+        if bbox_data is None:
+            return json_data
+        for bbox in bbox_data:
+            semantic_id = int(bbox["semanticId"])
+            labels = id_to_labels.get(str(semantic_id), id_to_labels.get(semantic_id))
+            if labels is None or not self._is_defect(labels):
+                continue
+            box = {"x_min": bbox["x_min"], "y_min": bbox["y_min"], "x_max": bbox["x_max"], "y_max": bbox["y_max"]}
+            if not self.check_bbox_area(box, 0.5):
+                continue
+            width = int(abs(box["x_max"] - box["x_min"]))
+            height = int(abs(box["y_max"] - box["y_min"]))
+            if width == _INVALID_BBOX_SIZE or height == _INVALID_BBOX_SIZE:
+                continue
+            json_data.append({"Id": semantic_id,
+                              "ObjectClassName": _class_label(labels),
+                              "Left": int(box["x_min"]),
+                              "Top": int(box["y_min"]),
+                              "Right": int(box["x_max"]),
+                              "Bottom": int(box["y_max"])})
+        return json_data
+
+    def _write_semantic_segmentation(self, seg_output, seg_dir: str):
+        semantic_data = np.asarray(_array(seg_output))
+        id_to_labels = _id_to_labels(seg_output)
+        remapped_data = np.zeros(semantic_data.shape[:2], dtype=np.uint32)
+        if semantic_data.ndim > 2:
+            semantic_data = semantic_data.view(np.uint32).reshape(semantic_data.shape[:2])
+        label_mapping = {}
+        for instance_id, labels in id_to_labels.items():
+            if not self._is_defect(labels):
+                continue
+            class_name = _class_label(labels)
+            if class_name not in self.semantic_label_map:
+                self.semantic_label_map[class_name] = len(self.semantic_label_map) + 1
+            class_id = self.semantic_label_map[class_name]
+            label_mapping[class_id] = {"class": class_name}
+            remapped_data[semantic_data == int(instance_id)] = class_id
+
+        self._backend.write_blob(f"{seg_dir}/{self._frame_id}.json", json.dumps(label_mapping).encode())
+        buf = io.BytesIO()
+        np.save(buf, remapped_data)
+        self._backend.write_blob(f"{seg_dir}/{self._frame_id}.npy", buf.getvalue())
 
     def write(self, data):
-        logger.warning(f"In render products with frame id: {self._frame_id}")
-        # Get all render products and prepare postfix
-        render_products = [key.replace('rp_', '-') for key in data.keys() if key.startswith('rp_RenderProduct_Replicator')]
-        if len(render_products) <= 1:
-            render_product_postfix = [""]
-        else:
-            render_product_postfix = render_products
-        
-        for postfix in render_product_postfix:
-            logging.warning(f"Working on postfix:{postfix}")
-            # Setting up keys and dir based on render product
-            bounding_box_2d_tight_key = f"bounding_box_2d_tight{postfix}"
+        for postfix in self._render_product_postfixes(data):
+            render_product_dir = f"{postfix[1:]}/" if postfix else ""
             rgb_key = f"rgb{postfix}"
-            semantic_segmentation_key = f"semantic_segmentation{postfix}"
-            # Remove '-' from postfix
-            render_product_dir = postfix[1:] if postfix != "" else ""
+            bbox_key = f"bounding_box_2d_tight{postfix}"
+            seg_key = f"semantic_segmentation{postfix}"
 
-            if rgb_key in data and bounding_box_2d_tight_key in data:
-                # Make sure that directories exist
-                bbox_dir = os.path.join(render_product_dir, "labels", "json")
-                image_dir =  os.path.join(render_product_dir, "images")
-                bbox_output_dir = os.path.join(self._output_dir, bbox_dir)
-                image_output_dir = os.path.join(self._output_dir, image_dir)
-                if not os.path.exists(bbox_output_dir):
-                    os.makedirs(bbox_output_dir)
-                if not os.path.exists(image_output_dir):
-                    os.makedirs(image_output_dir)
+            if rgb_key in data:
+                self._backend.write_image(
+                    f"{render_product_dir}images/{self._frame_id}.{self._image_output_format}",
+                    _array(data[rgb_key]),
+                )
 
-                # Get bbox data
-                bbox_data = data[bounding_box_2d_tight_key]["data"]
-                id_to_labels = data[bounding_box_2d_tight_key]["info"]["idToLabels"]
-                exists = False
+            if bbox_key in data:
+                self._backend.write_blob(
+                    f"{render_product_dir}labels/json/{self._frame_id}.json",
+                    json.dumps(self._bbox_json(data[bbox_key])).encode(),
+                )
 
-                # Check if a defect exists in this image or not TODO: Do we want to keep images with no defects ?
-                for id, labels in id_to_labels.items():
-                    if labels['class'].split("_")[0] in self.all_labels:
-                        exists = True
-                        break
+            if seg_key in data:
+                self._write_semantic_segmentation(data[seg_key], f"{render_product_dir}semantic_segmentation")
 
-                if exists:
-                    # Save image and bbox data in BMW Format
-                    json_data = []
-                    for bbox in bbox_data:
-                        target_bbox_data = {'x_min': bbox['x_min'], 'y_min': bbox['y_min'],
-                                            'x_max': bbox['x_max'], 'y_max': bbox['y_max']}
-                        id = int(bbox[0])
-                        label = id_to_labels[str(id)]['class'].split("_")[0]
-
-                        if self.check_bbox_area(target_bbox_data, 0.5):
-                            width = int(abs(target_bbox_data["x_max"] - target_bbox_data["x_min"]))
-                            height = int(abs(target_bbox_data["y_max"] - target_bbox_data["y_min"]))
-
-                            if width != 2147483647 and height != 2147483647:
-                                coco_bbox_data = {"Id": id,
-                                                "ObjectClassName": label,
-                                                "Left": int(target_bbox_data["x_min"]),
-                                                "Top": int(target_bbox_data["y_min"]),
-                                                "Right": int(target_bbox_data["x_max"]),
-                                                "Bottom": int(target_bbox_data["y_max"])}
-                                json_data.append(coco_bbox_data)
-
-                        # Write the rgb image into a file
-                        filepath = os.path.join(image_dir, f"{self._frame_id}.{self._image_output_format}")
-                        self._backend.write_image(filepath, data[rgb_key])
-
-                        bbox_filepath = os.path.join(bbox_dir, f"{self._frame_id}.json")
-        
-                        # Write the bbox values to the json file
-                        buf = io.BytesIO()
-                        buf.write(json.dumps(json_data).encode())
-                        self._backend.write_blob(bbox_filepath, buf.getvalue())
-
-            if semantic_segmentation_key in data:
-                # Make sure that directories exist
-                semantic_segmentation_dir =  os.path.join(render_product_dir, "semantic_segmentation")
-                semantic_segmentation_output_dir = os.path.join(self._output_dir, semantic_segmentation_dir)
-                if not os.path.exists(semantic_segmentation_output_dir):
-                    os.makedirs(semantic_segmentation_output_dir)
-                
-                # Get semantic data
-                semantic_data = data[semantic_segmentation_key]["data"]
-                id_to_labels = data[semantic_segmentation_key]["info"]["idToLabels"]
-                exists = False
-                segmentation_label_mapping_json = {}
-
-            # Check if a defect exists in this image or not TODO: Do we want to keep images with no defects ?
-                for id, labels in id_to_labels.items():
-                    if labels['class'].split("_")[0] in self.all_labels:
-                        exists = True
-                        break
-
-                # Save semantic segmentation data in BMW Format
-                if exists:
-                    count = len(self.semantic_label_map)
-                    numpy_data = semantic_data
-                    json_data = id_to_labels
-                    for key, value in json_data.items():
-                        if '_' in value['class']:
-                            new_class = value['class'].split('_')[0]
-                            if new_class not in self.semantic_label_map:
-                                self.semantic_label_map[new_class] = count
-                                count +=1
-                            segmentation_label_mapping_json[self.semantic_label_map[new_class]] = {'class': new_class}
-                            semantic_data = [
-                                [self.semantic_label_map[new_class] if pixel == key else pixel for pixel in row]
-                                for row in semantic_data
-                            ]
-                        else:
-                            if value['class'] not in self.semantic_label_map:
-                                self.semantic_label_map[value['class']] = count
-                                count += 1
-                            segmentation_label_mapping_json[self.semantic_label_map[value['class']]] = {'class': value['class']}
-                            semantic_data = [
-                                [self.semantic_label_map[value['class']] if pixel == key else pixel for pixel in row]
-                                for row in semantic_data
-                            ]
-
-
-
-
-
-
-
-                    filepath = f"{self._frame_id}"
-
-                    # Write the label information to the json file
-                    buf = io.BytesIO()
-                    buf.write(json.dumps(segmentation_label_mapping_json).encode())
-                    self._backend.write_blob(os.path.join(semantic_segmentation_dir, filepath + ".json"), buf.getvalue())
-
-                    # Write the semantic data values to the npy file
-                    with open(os.path.join(semantic_segmentation_output_dir, filepath + ".npy"), 'xb') as f:
-                        np.save(f, np.array(numpy_data))
-
-        # Increment frame id
         self._frame_id += 1

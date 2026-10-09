@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import omni.ext
+from omni.kit.menu.utils import MenuItemDescription, add_menu_items, refresh_menu_items, remove_menu_items
 from defect.generation.ui.main_window import MainWindow
 
 class DefectsGenerator(omni.ext.IExt):
@@ -23,35 +24,43 @@ class DefectsGenerator(omni.ext.IExt):
     def __init__(self) -> None:
         super().__init__()
         self._window = None
+        self._menu = []
 
     def on_startup(self, ext_id):
-        self._menu = omni.kit.ui.get_editor_menu().add_item(
-            DefectsGenerator.MENU_PATH, self.show_window, toggle=True, value=True
-        )
+        self._menu = [
+            MenuItemDescription(
+                name=self.WINDOW_NAME,
+                ticked_fn=self._is_window_visible,
+                onclick_fn=lambda: self.show_window(None, not self._is_window_visible()),
+            )
+        ]
+        add_menu_items(self._menu, "Window")
         self.show_window(None, True)
     
     def on_shutdown(self):
         if self._menu:
-            omni.kit.ui.get_editor_menu().remove_item(DefectsGenerator.MENU_PATH)
-            self._menu
+            remove_menu_items(self._menu, "Window")
+            self._menu = []
         if self._window:
+            self._window.set_visibility_changed_fn(None)
             self._window.destroy()
             self._window = None
 
+    def _is_window_visible(self):
+        return self._window is not None and self._window.visible
+
     def _set_menu(self, value):
-        omni.kit.ui.get_editor_menu().set_value(DefectsGenerator.MENU_PATH, value)
+        refresh_menu_items("Window")
 
     def _visibility_changed_fn(self, visible):
         self._set_menu(visible)
-        if not visible:
-            self._window = None
 
     def show_window(self, menu, value):
-        self._set_menu(value)
         if value:
-            self._set_menu(True)
-            self._window = MainWindow(DefectsGenerator.WINDOW_NAME, width=450, height=700)
-            self._window.set_visibility_changed_fn(self._visibility_changed_fn)
+            if self._window is None:
+                self._window = MainWindow(DefectsGenerator.WINDOW_NAME, width=450, height=700)
+                self._window.set_visibility_changed_fn(self._visibility_changed_fn)
+            self._window.visible = True
         elif self._window:
             self._window.visible = False
-
+        self._set_menu(value)

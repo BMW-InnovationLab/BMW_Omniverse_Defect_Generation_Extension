@@ -2,6 +2,8 @@
 
 This extension for NVIDIA Omniverse allows users to create defects and apply them to prims within an Isaac Sim simulation environment. The extension also provides the means to generate annotated images with customizable domain randomization effects.
 
+Tested with Isaac Sim 6.0 (Replicator 1.13).
+
 | ![Loading pc 1](./exts/defect.generation/data/Frames_Burgundy_V03.0107.png) | ![Loading pc 2](./exts/defect.generation/data/Frames_Blue_v04.0784.png) |
 |:----------------------------------------------------------:|:-----------------------------------------------------------------:|
 
@@ -151,7 +153,8 @@ output_directory/
 4. **Build the Defect Layer and Run the Scene**:
    - Click the `Create Replicator Layer` button to create the replicator xform with all the configured defects.
    - Click the `Preview` button to test your scene and the domain randomization.
-   - Click the `Run for` button to execute the replicator for the number of frames set, which will start capturing images and randomizing the scene and defects.
+   - Click the `Run for` button to execute the replicator for the number of frames set, which will start capturing images and randomizing the scene and defects. Images and annotations are only written by `Run for`.
+   - With the BMW writer, each frame produces `images/<frame>.png`, `labels/json/<frame>.json` (when bounding boxes are enabled) and `semantic_segmentation/<frame>.npy|.json` (when segmentation is enabled) in the output folder.
    - Click the `Delete Replicator Layer` button to remove the `Replicator` xform, the `/World/Looks` xform, and every `Projection` xform created in all defect objects.
 
 ![Loading pc](./exts/defect.generation/data/extension_preview_3.png)

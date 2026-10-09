@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-10-09
+
+### Added
+
+- Support for Isaac Sim 6.0 (Kit 110 / Replicator 1.13).
+- Progress log when the Replicator graph is ready (defect, camera and frame count).
+
+### Fixed
+
+- Isaac Sim 6 (Kit 110 / Replicator 1.13) compatibility: Pydantic v2 models,
+  `omni.kit.menu.utils` window menu, `max_execs` frame trigger, XYZ transforms,
+  missing manifest dependencies and exact projection target lookup.
+- BMW writer: write RGB, bounding box JSON and segmentation for every frame
+  through the Replicator backend; match defect labels containing underscores.
+- Without camera randomization, frame the defect targets instead of placing the
+  camera at the world origin, which produced empty images.
+- Stop Replicator before previewing, rebuilding or deleting the graph, use the
+  UI output/annotator settings for every button, and abort when cleanup fails.
+- Default to the bundled `data/example` texture folder.
+
 ## [1.1.1] - 2023-08-23
 
 ### Changed
